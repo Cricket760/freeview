@@ -12,7 +12,7 @@ const DEFAULT_MOVE_TIME_MS = 3000;
 // If the engine says nothing for this long after that, it is stuck.
 const HANG_GRACE_MS = 5000;
 
-export const ANALYSIS_CANCELLED = 'Analysis cancelled';
+export const ANALYSIS_CANCELLED = 'Analysis cancelled'; 
 
 interface PendingSearch {
   reject: (err: Error) => void;
