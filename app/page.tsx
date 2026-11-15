@@ -41,12 +41,13 @@ const SAMPLE_PGN = `[Event "Opera Game"]
 /*  Analysis speed choices                                                    */
 /*  depth = how many moves ahead the engine looks. Each extra level costs     */
 /*  roughly 1.5x more time, so Deep is MUCH slower than Quick.                */
-/*  ms    = the most time one position may take (keeps slow phones safe).     */
+/*  ms    = the most time one position may take. On a fast computer the       */
+/*          depth is reached sooner, so the real time is often much lower.    */
 /* -------------------------------------------------------------------------- */
 const SPEED_MODES = {
-  quick: { label: 'Quick', depth: 14, ms: 2000, hint: 'Fastest. Fine for a first look.' },
-  standard: { label: 'Standard', depth: 16, ms: 3000, hint: 'Good balance of speed and accuracy.' },
-  deep: { label: 'Deep', depth: 19, ms: 6000, hint: 'Most accurate, but 3x slower or more.' },
+  quick: { label: 'Quick', depth: 14, ms: 1000, hint: 'Up to 1 second per move. Fastest.' },
+  standard: { label: 'Standard', depth: 16, ms: 2000, hint: 'Up to 2 seconds per move. Good balance.' },
+  deep: { label: 'Deep', depth: 19, ms: 5000, hint: 'Up to 5 seconds per move. Most accurate, but slow.' },
 } as const;
 type SpeedMode = keyof typeof SPEED_MODES;
 
@@ -112,6 +113,9 @@ export default function GameReviewPage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
+  const [engineThreads, setEngineThreads] = useState(0); // 0 = engine not started yet
+  const [analysisNote, setAnalysisNote] = useState<string | null>(null);
   const [speed, setSpeed] = useState<SpeedMode>('standard');
   const [flipped, setFlipped] = useState(false);
   // After a review finishes we hide the PGN box. "New review" brings it back.
@@ -136,6 +140,8 @@ export default function GameReviewPage() {
     setErrorMsg(null);
     setIsAnalyzing(true);
     setProgress(0);
+    setEtaSeconds(null);
+    setAnalysisNote(null);
     setReviewedMoves([]);
     setHeaders({});
     setCurrentIndex(-1);
@@ -152,22 +158,53 @@ export default function GameReviewPage() {
       // Load the opening book and start the engine at the same time
       const [book] = await Promise.all([loadOpeningBook(), engine.init()]);
       await engine.newGame();
-
-      // evals[0] = start position, evals[i + 1] = position after ply i.
-      // The position after one move is the position before the next move,
-      // so every position is analysed exactly once.
-      const total = plies.length + 1;
-      const evals: EngineEval[] = [];
-      evals.push(await engine.evaluateFen(plies[0].fenBefore, mode.depth, mode.ms));
-      setProgress(Math.round((1 / total) * 100));
-
-      for (let i = 0; i < plies.length; i++) {
-        evals.push(await engine.evaluateFen(plies[i].fenAfter, mode.depth, mode.ms));
-        setProgress(Math.round(((i + 2) / total) * 100));
-      }
+      setEngineThreads(engine.threadCount);
 
       // Which moves are still "opening theory"?
       const bookInfo = findBookMoves(plies.map((p) => p.fenAfter), book);
+
+      // evals[k] = the position BEFORE ply k (and after ply k - 1).
+      // evals[0] = start position, evals[plies.length] = final position.
+      // The position after one move is the position before the next move,
+      // so every position is analysed exactly once.
+      const total = plies.length + 1;
+      const startedAt = Date.now();
+      const evals: EngineEval[] = [];
+      const reachedDepths: number[] = [];
+
+      for (let k = 0; k < total; k++) {
+        const fen = k === 0 ? plies[0].fenBefore : plies[k - 1].fenAfter;
+
+        // Book moves always get 100 accuracy, so positions inside opening theory
+        // only need a quick look (for the eval bar). This saves a lot of time.
+        // The LAST book position is searched fully: the first real move compares to it.
+        const bookBefore = k === 0 || bookInfo[k - 1].isBook;
+        const bookAfter = k === plies.length || bookInfo[k].isBook;
+        const inTheory = bookBefore && bookAfter;
+
+        const ev = inTheory
+          ? await engine.evaluateFen(fen, 10, 300)
+          : await engine.evaluateFen(fen, mode.depth, mode.ms);
+        evals.push(ev);
+        if (!inTheory && ev.depth !== undefined) reachedDepths.push(ev.depth);
+
+        // Progress and a rough "time left" guess from the speed so far
+        const done = k + 1;
+        setProgress(Math.round((done / total) * 100));
+        const secondsPerPosition = (Date.now() - startedAt) / 1000 / done;
+        setEtaSeconds(Math.round(secondsPerPosition * (total - done)));
+      }
+
+      // If the time limit cut the search short, tell the user honestly
+      if (reachedDepths.length > 0) {
+        const avg = reachedDepths.reduce((a, b) => a + b, 0) / reachedDepths.length;
+        if (avg < mode.depth - 2) {
+          setAnalysisNote(
+            `Your computer reached about depth ${Math.round(avg)} of ${mode.depth} before the time limit. ` +
+              `Some labels may be less exact. The Deep speed gives the engine more time per move.`
+          );
+        }
+      }
 
       const results: ReviewedMove[] = plies.map((ply, idx) =>
         classifyPly({
@@ -448,6 +485,11 @@ export default function GameReviewPage() {
                   ))}
                 </div>
                 <p className="mt-1.5 text-xs text-[#989795]">{SPEED_MODES[speed].hint}</p>
+                {engineThreads > 0 && (
+                  <p className="mt-1 text-xs text-[#989795]">
+                    Engine: {engineThreads > 1 ? `${engineThreads} CPU threads` : '1 thread (multi-thread not available)'}
+                  </p>
+                )}
               </div>
 
               {errorMsg && (
@@ -471,7 +513,9 @@ export default function GameReviewPage() {
                   disabled={isAnalyzing}
                   className="flex-1 rounded-md bg-[#81b64c] py-3 text-base font-extrabold text-white shadow-[0_4px_0_#45753c] transition hover:bg-[#8fc255] disabled:bg-[#3a3835] disabled:shadow-none"
                 >
-                  {isAnalyzing ? `Analyzing... ${progress}%` : 'Start Review'}
+                  {isAnalyzing
+                    ? `Analyzing... ${progress}%${etaSeconds !== null && progress < 100 ? ` · about ${etaSeconds}s left` : ''}`
+                    : 'Start Review'}
                 </button>
                 {isAnalyzing && (
                   <button
@@ -546,6 +590,12 @@ export default function GameReviewPage() {
                   <div className="text-[10px] uppercase tracking-wide opacity-70">Accuracy</div>
                 </div>
               </div>
+
+              {analysisNote && (
+                <p className="mx-4 mb-3 rounded border border-yellow-700/50 bg-yellow-950/40 p-2 text-xs text-yellow-200">
+                  {analysisNote}
+                </p>
+              )}
 
               {/* Eval graph. Click it to jump to a move. */}
               <div className="px-4 pb-3">

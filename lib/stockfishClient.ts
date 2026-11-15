@@ -12,7 +12,13 @@ const DEFAULT_MOVE_TIME_MS = 3000;
 // If the engine says nothing for this long after that, it is stuck.
 const HANG_GRACE_MS = 5000;
 
-export const ANALYSIS_CANCELLED = 'Analysis cancelled'; 
+export const ANALYSIS_CANCELLED = 'Analysis cancelled';
+
+// Two engines. The multi-thread one uses several CPU cores (much faster) but
+// needs a "cross-origin isolated" page. The single-thread one works everywhere.
+const THREADED_SCRIPT = '/engine/mt/stockfish.js';
+const SINGLE_SCRIPT = '/engine/stockfish.js';
+const MAX_THREADS = 6;
 
 interface PendingSearch {
   reject: (err: Error) => void;
@@ -22,39 +28,98 @@ interface PendingSearch {
 export class StockfishAnalyzer {
   private worker: Worker | null = null;
   private isReady = false;
+  private threads = 1;
+  // Set if the multi-thread engine failed or hung. We then stay single-thread.
+  private forceSingle = false;
   private pending: PendingSearch | null = null;
   // Searches wait in line, so two can never run at once
   private queue: Promise<unknown> = Promise.resolve();
 
+  /** How many CPU threads the engine is using (1 = single-thread mode). */
+  get threadCount(): number {
+    return this.threads;
+  }
+
+  /**
+   * Threads need SharedArrayBuffer, which the browser only gives to
+   * "cross-origin isolated" pages (your headers already do this).
+   * We leave one core free so the page stays smooth while analysing.
+   */
+  private pickThreadCount(): number {
+    if (this.forceSingle) return 1;
+    if (typeof SharedArrayBuffer === 'undefined' || !globalThis.crossOriginIsolated) return 1;
+    const cores = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 2 : 2;
+    return Math.max(1, Math.min(cores - 1, MAX_THREADS));
+  }
+
   async init(): Promise<void> {
     if (this.worker) return;
-    this.worker = new Worker('/engine/stockfish.js');
 
-    await new Promise<void>((resolve, reject) => {
-      if (!this.worker) return reject(new Error('Worker initialization failed'));
+    const wanted = this.pickThreadCount();
+    if (wanted >= 2) {
+      try {
+        await this.startWorker(THREADED_SCRIPT, wanted);
+        return;
+      } catch {
+        // Multi-thread engine would not start. Use the safe single-thread one.
+        this.forceSingle = true;
+        this.killWorker();
+      }
+    }
+    await this.startWorker(SINGLE_SCRIPT, 1);
+  }
 
-      const timeout = setTimeout(() => reject(new Error('Stockfish init timeout')), 10_000);
+  /** Starts one engine file and waits until it says it is ready. */
+  private startWorker(script: string, threads: number): Promise<void> {
+    const worker = new Worker(script);
+    this.worker = worker;
 
-      this.worker.onmessage = (e: MessageEvent<string>) => {
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Stockfish init timeout')), 12_000);
+      let testing = false;
+
+      const finish = () => {
+        clearTimeout(timeout);
+        this.isReady = true;
+        this.threads = threads;
+        resolve();
+      };
+
+      worker.onmessage = (e: MessageEvent<string>) => {
         const line = String(e.data);
         if (line.includes('uciok')) {
+          // Options must be sent before "isready"
+          if (threads > 1) worker.postMessage(`setoption name Threads value ${threads}`);
           // Ask for the TOP TWO moves. The gap between them finds "Great" moves.
-          this.worker?.postMessage('setoption name MultiPV value 2');
-          this.worker?.postMessage('isready');
-        } else if (line.includes('readyok')) {
-          clearTimeout(timeout);
-          this.isReady = true;
-          resolve();
+          worker.postMessage('setoption name MultiPV value 2');
+          worker.postMessage('isready');
+        } else if (line.includes('readyok') && !testing) {
+          if (threads === 1) return finish();
+          // Multi-thread engines can start fine and still hang on the first search
+          // (for example if the browser blocks their helper threads).
+          // So run one tiny search. If it answers, threads really work.
+          testing = true;
+          worker.postMessage('position startpos');
+          worker.postMessage('go depth 8');
+        } else if (testing && line.startsWith('bestmove')) {
+          finish();
         }
       };
 
-      this.worker.onerror = () => {
+      worker.onerror = () => {
         clearTimeout(timeout);
         reject(new Error('Failed to load local Stockfish WASM worker.'));
       };
 
-      this.worker.postMessage('uci');
+      worker.postMessage('uci');
     });
+  }
+
+  private killWorker(): void {
+    this.worker?.terminate();
+    this.worker = null;
+    this.isReady = false;
+    this.threads = 1;
   }
 
   /** Tells the engine a new game starts, so old cached results are not reused. */
@@ -139,6 +204,7 @@ export class StockfishAnalyzer {
       // Safety net only. Normally the engine ends the search on its own.
       const timer = setTimeout(() => {
         this.pending = null; // so terminate() does not report "cancelled" instead
+        if (this.threads > 1) this.forceSingle = true; // threads may be the problem
         this.terminate(); // kills the stuck worker; next call starts a fresh one
         reject(new Error('Stockfish stopped responding. Please try again.'));
       }, safeTime + HANG_GRACE_MS);
@@ -187,6 +253,7 @@ export class StockfishAnalyzer {
             cp: best?.cp ?? 0,
             mate: best?.mate ?? null,
             bestMoveUci: bestMatch ? bestMatch[1] : best?.move ?? '',
+            depth: best?.depth, // how deep the engine really got
           };
           // Only trust line 2 if it was searched about as deep as line 1.
           // (If time ran out mid-search, line 2 can be stale.)
@@ -209,8 +276,6 @@ export class StockfishAnalyzer {
       this.pending.reject(new Error(ANALYSIS_CANCELLED));
       this.pending = null;
     }
-    this.worker?.terminate();
-    this.worker = null;
-    this.isReady = false;
+    this.killWorker();
   }
 }

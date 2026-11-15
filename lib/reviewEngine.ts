@@ -27,6 +27,8 @@ export interface EngineEval {
   bestMoveUci: string; // e.g., "e2e4" (empty string if the game is already over)
   // The engine's SECOND best line (White's perspective). Used to find "Great" moves.
   alt?: { cp: number; mate: number | null };
+  // How deep the engine got. On slow computers the time limit can stop it early.
+  depth?: number;
   // Set when the position is a finished game (the engine can't search those).
   terminal?: 'checkmate' | 'draw';
 }
@@ -65,6 +67,7 @@ const WIN_PERCENT_K = 0.00368208; // Lichess curve: centipawns -> win chance
 const ACCURACY_K = 0.065;         // Higher = harsher accuracy for each lost win%
 const SACRIFICE_MIN_POINTS = 2;   // Net material given up to count as a "sacrifice"
 const GREAT_MIN_GAP = 15;         // 2nd best move must be this many win% worse
+const MIN_RELIABLE_DEPTH = 12;    // Below this, skip Brilliant/Great (too easy to be wrong)
 const QUIESCE_DEPTH = 6;          // How many capture replies we look through
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
@@ -339,6 +342,9 @@ export function classifyPly(params: {
     winLoss = Math.max(winLoss, 10);
   }
 
+  // If the engine was stopped too early, its "only move" and "sacrifice" calls are guesses
+  const reliable = (evalBeforeWhite.depth ?? MIN_RELIABLE_DEPTH) >= MIN_RELIABLE_DEPTH;
+
   // How much worse was the engine's 2nd best move than its best move?
   let secondBestGap = 0;
   if (evalBeforeWhite.alt) {
@@ -353,6 +359,7 @@ export function classifyPly(params: {
   } else if (isBook) {
     classification = 'Book';
   } else if (
+    reliable &&
     isBrilliantMove({
       ply,
       uci,
@@ -368,6 +375,7 @@ export function classifyPly(params: {
   } else if (
     // Great = you found the ONLY good move. Not for mating moves, not when the
     // game was already lost (<15%) or already crushing (>90%).
+    reliable &&
     playedBest &&
     !givesMate &&
     ply > 6 &&
