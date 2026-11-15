@@ -377,8 +377,9 @@ export default function GameReviewPage() {
     </div>
   );
 
+  // pb-24 on phones leaves room so the pinned control bar never covers the content
   return (
-    <main className="min-h-screen bg-[#262522] text-[#c3c2c1]">
+    <main className="min-h-screen bg-[#262522] pb-24 text-[#c3c2c1] lg:pb-0">
       {/* Top bar */}
       <header className="border-b border-black/30 bg-[#21201d] px-5 py-3">
         <span className="text-xl font-extrabold tracking-tight text-white">
@@ -696,8 +697,10 @@ export default function GameReviewPage() {
                 ))}
               </div>
 
-              {/* Controls stay at the bottom */}
-              <div className="mt-3 flex items-center justify-center gap-2 border-t border-black/30 bg-[#1b1a18] p-3">
+              {/* Controls. On phones this bar is pinned to the bottom of the screen,
+                  so the arrows are always reachable while the board is in view.
+                  On big screens (lg) it is a normal bar at the end of the panel. */}
+              <div className="fixed inset-x-0 bottom-0 z-30 flex items-center justify-center gap-2 border-t border-black/40 bg-[#1b1a18] p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] lg:static lg:mt-3 lg:p-3">
                 {[
                   { label: 'First move', icon: <ChevronsLeft size={20} />, go: () => setCurrentIndex(-1), off: currentIndex < 0 },
                   { label: 'Previous move', icon: <ChevronLeft size={20} />, go: () => setCurrentIndex((i) => Math.max(-1, i - 1)), off: currentIndex < 0 },
